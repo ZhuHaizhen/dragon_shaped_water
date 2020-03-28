@@ -1,0 +1,573 @@
+---
+title: "16S"
+author: "ZHZ"
+date: "2020/3/23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## import libraries
+
+```{r warning=FALSE}
+library(tidyverse)
+library(reshape2)
+library(doBy)
+library(FSA)
+library(multcompView)
+library(vegan)
+library(pheatmap)
+library(RColorBrewer)
+library(amplicon)
+library(randomForest)
+
+meta <- read.table('sample-metadata.tsv', header = T, sep = '\t')
+```
+
+## alpha diversity
+
+```{r}
+alpha <- read.table('alpha.txt', header = T, row.names = 1, sep = '\t') %>%
+  mutate(SampleID = row.names(.)) %>%
+  arrange(SampleID) %>%
+  inner_join(meta,by = "SampleID")
+
+mystats <- function(x, na.omit = F){
+  if (na.omit)
+    x <- x[!is.na(x)]
+  avg <- mean(x)
+  n <- length(x)
+  sd <- sd(x)
+  se <- sd(x) / sqrt(n)
+  return(c(n = n, avg = avg, sd = sd, se = se))
+}
+
+alpha.summary <- summaryBy(shannon + goods_coverage + chao1 + observed_otus ~ Group, alpha, FUN = mystats)
+write.table(alpha.summary, 'alpha_summary.txt', sep = '\t')
+
+shapiro.test(alpha$shannon)  # W = 0.80391, p-value = 2.333e-11
+shapiro.test(alpha$goods_coverage)  # W = 0.96757, p-value = 0.005388
+shapiro.test(alpha$chao1)  # W = 0.83411, p-value = 2.709e-10
+shapiro.test(alpha$observed_otus)  # W = 0.77148, p-value = 2.192e-12
+
+kruskal.test(shannon ~ Group, alpha)  # chi-squared = 82.923, df = 7, p-value = 3.486e-15
+kruskal.test(goods_coverage ~ Group, alpha)  # chi-squared = 89.193, df = 7, p-value < 2.2e-16
+kruskal.test(chao1 ~ Group, alpha)  # chi-squared = 86.551, df = 7, p-value = 6.308e-16
+kruskal.test(observed_otus ~ Group, alpha)  #chi-squared = 87.423, df = 7, p-value = 4.18e-16
+
+shannon.multi <- dunnTest(shannon ~ Group, alpha, method = 'bh')$res
+shannon.multi$Comparison <- gsub(' - ', '-', shannon.multi$Comparison, perl = T)
+shannon.multi <- shannon.multi %>% column_to_rownames('Comparison')
+multcompLetters(t(shannon.multi)[3, ])
+# W1L  W1R  W1S  W1W  W6L  W6R  W6S  W6W 
+# "a" "ab"  "b"  "c"  "a"  "a"  "a"  "c" 
+cov.multi <- dunnTest(goods_coverage ~ Group, alpha, method = 'bh')$res
+cov.multi$Comparison <- gsub(' - ', '-', cov.multi$Comparison, perl = T)
+cov.multi <- cov.multi %>% column_to_rownames('Comparison')
+multcompLetters(t(cov.multi)[3, ])
+# W1L  W1R  W1S  W1W  W6L  W6R  W6S  W6W 
+# "a"  "a" "bc"  "d"  "b" "ac"  "a"  "d" 
+chao1.multi <- dunnTest(chao1 ~ Group, alpha, method = 'bh')$res
+chao1.multi$Comparison <- gsub(' - ', '-', chao1.multi$Comparison, perl = T)
+chao1.multi <- chao1.multi %>% column_to_rownames('Comparison')
+multcompLetters(t(chao1.multi)[3, ])
+# W1L W1R W1S W1W W6L W6R W6S W6W 
+# "a" "a" "b" "c" "a" "a" "a" "c" 
+observed.multi <- dunnTest(observed_otus ~ Group, alpha, method = 'bh')$res
+observed.multi$Comparison <- gsub(' - ', '-', observed.multi$Comparison, perl = T)
+observed.multi <- observed.multi %>% column_to_rownames('Comparison')
+multcompLetters(t(observed.multi)[3, ])
+# W1L W1R W1S W1W W6L W6R W6S W6W 
+# "a" "a" "b" "c" "a" "a" "a" "c"
+```
+
+## beta diversity
+
+```{r}
+counts <- read.table('otu_table_rare.txt', header = T, row.names = 1, sep = '\t')
+counts.raw <- counts %>%
+  select(-taxonomy)
+```
+
+### ANOSIM
+
+```{r}
+meta.cca <- meta %>%
+  column_to_rownames('SampleID')
+
+idx <-  rownames(meta.cca) %in% colnames(counts.raw) 
+sub_design <- meta.cca[idx,]
+sub_otu_table <- counts.raw[, rownames(sub_design)]
+
+anosim.type <- anosim(t(sub_otu_table), sub_design$Type, permutations = 1000, distance = 'bray', parallel = 4)  # ANOSIM statistic R: 0.7022, Significance: 0.000999
+plot(anosim.type, col = c('grey', '#1B9E77', '#D95F02', '#7570B3', '#E7298A'))
+anosim.region <- anosim(t(sub_otu_table), sub_design$Region, permutations = 1000, distance = 'bray', parallel = 4)  # ANOSIM statistic R: 0.3399, Significance: 0.000999
+plot(anosim.region, col = c('grey', '#66A61E', '#E6AB02'))
+anosim(t(sub_otu_table), sub_design$Group, permutations = 1000, distance = 'bray', parallel = 4)  # ANOSIM statistic R: 0.9117, Significance: 0.000999
+
+type <- unique(sub_design$Type)
+anosim.type.pair <- NULL
+
+for (i in 1:(length(type) - 1)) {
+  for (j in (i + 1):length(type)) {
+    design.type.ij <- subset(sub_design, Type == type[i] | Type == type[j])
+    otu.type.ij <- t(sub_otu_table)[row.names(design.type.ij), ]
+    anosim.type.ij <- anosim(otu.type.ij, design.type.ij$Type, permutations = 1000, distance = 'bray')
+    
+    if (anosim.type.ij$signif <= 0.001) Sig <- '***'
+    else if (anosim.type.ij$signif <= 0.01) Sig <- '**'
+    else if (anosim.type.ij$signif <= 0.05) Sig <- '*'
+    else Sig <- NA
+        
+    anosim.type.pair <- rbind(anosim.type.pair, c(paste(type[i], type[j], sep = '/'), 'Bray-Curtis', anosim.type.ij$statistic, anosim.type.ij$signif, Sig))
+  }
+}
+
+anosim.type.pair <- data.frame(anosim.type.pair, stringsAsFactors = FALSE)
+names(anosim.type.pair) <- c('group', 'distance', 'R', 'P_value', 'Sig')
+anosim.type.pair$p.adjust <- p.adjust(anosim.type.pair$P_value, 'fdr')
+write.table(anosim.type.pair, 'ANOSIM_type.txt', row.names = FALSE, sep = '\t', quote = FALSE, na = '')
+
+group <- unique(sub_design$Group)
+anosim.group.pair <- NULL
+
+for (i in 1:(length(group) - 1)) {
+  for (j in (i + 1):length(group)) {
+    design.group.ij <- subset(sub_design, Group == group[i] | Group == group[j])
+    otu.group.ij <- t(sub_otu_table)[row.names(design.group.ij), ]
+    anosim.group.ij <- anosim(otu.group.ij, design.group.ij$Group, permutations = 1000, distance = 'bray')
+    
+    if (anosim.group.ij$signif <= 0.001) Sig <- '***'
+    else if (anosim.group.ij$signif <= 0.01) Sig <- '**'
+    else if (anosim.group.ij$signif <= 0.05) Sig <- '*'
+    else Sig <- NA
+        
+    anosim.group.pair <- rbind(anosim.group.pair, c(paste(group[i], group[j], sep = '/'), 'Bray-Curtis', anosim.group.ij$statistic, anosim.group.ij$signif, Sig))
+  }
+}
+
+anosim.group.pair <- data.frame(anosim.group.pair, stringsAsFactors = FALSE)
+names(anosim.group.pair) <- c('group', 'distance', 'R', 'P_value', 'Sig')
+anosim.group.pair$p.adjust <- p.adjust(anosim.group.pair$P_value, 'fdr')
+write.table(anosim.group.pair, 'ANOSIM_group.txt', row.names = FALSE, sep = '\t', quote = FALSE, na = '')
+```
+
+### Adonis
+
+```{r}
+adonis(t(sub_otu_table) ~ sub_design$Type, permutations = 1000, distance = 'bray', parallel = 4)
+#                  Df SumsOfSqs MeanSqs F.Model      R2   Pr(>F)    
+# sub_design$Type   3    14.411  4.8038  31.023 0.44516 0.000999 ***
+# Residuals       116    17.962  0.1548         0.55484             
+# Total           119    32.374                 1.00000             
+adonis(t(sub_otu_table) ~ sub_design$Region, permutations = 1000, distance = 'bray', parallel = 4)
+#                    Df SumsOfSqs MeanSqs F.Model      R2   Pr(>F)    
+# sub_design$Region   1     4.287  4.2871  18.011 0.13243 0.000999 ***
+# Residuals         118    28.087  0.2380         0.86757             
+# Total             119    32.374                 1.00000             
+
+# https://github.com/pmartinezarbizu/pairwiseAdonis/blob/master/pairwiseAdonis
+pairwise.adonis <- function(x,factors, sim.function = 'vegdist', sim.method = 'bray', p.adjust.m ='bonferroni',reduce = NULL,perm = 999){
+  co <- combn(unique(as.character(factors)), 2)
+  pairs <- c()
+  Df <- c()
+  SumsOfSqs <- c()
+  F.Model <- c()
+  R2 <- c()
+  p.value <- c()
+  
+  for(elem in 1:ncol(co)){
+    if(inherits(x, 'dist')){
+      x1=as.matrix(x)[factors %in% c(as.character(co[1,elem]), as.character(co[2,elem])),
+                      factors %in% c(as.character(co[1,elem]), as.character(co[2,elem]))]
+      }
+    else  (
+      if (sim.function == 'daisy'){x1 = daisy(x[factors %in% c(co[1,elem], co[2, elem]),], metric = sim.method)} 
+      else{x1 = vegdist(x[factors %in% c(co[1,elem], co[2, elem]), ], method = sim.method)}
+    )
+    
+    ad <- adonis(x1 ~ factors[factors %in% c(co[1, elem], co[2, elem])], permutations = perm)
+    pairs <- c(pairs, paste(co[1,elem], 'vs', co[2,elem]))
+    Df <- c(Df, ad$aov.tab[1, 1])
+	  SumsOfSqs <- c(SumsOfSqs, ad$aov.tab[1, 2])
+	  F.Model <- c(F.Model, ad$aov.tab[1, 4])
+    R2 <- c(R2, ad$aov.tab[1, 5])
+    p.value <- c(p.value, ad$aov.tab[1, 6])
+  }
+  p.adjusted <- p.adjust(p.value, method = p.adjust.m)
+  
+  sig = c(rep('', length(p.adjusted)))
+  sig[p.adjusted <= 0.05] <-'.'
+  sig[p.adjusted <= 0.01] <-'*'
+  sig[p.adjusted <= 0.001] <-'**'
+  sig[p.adjusted <= 0.0001] <-'***'
+  pairw.res <- data.frame(pairs, Df, SumsOfSqs, F.Model, R2, p.value, p.adjusted, sig)
+  
+  if(!is.null(reduce)){
+    pairw.res <- subset (pairw.res, grepl(reduce, pairs))
+    pairw.res$p.adjusted <- p.adjust(pairw.res$p.value, method = p.adjust.m)
+    
+    sig = c(rep('',length(pairw.res$p.adjusted)))
+ 	  sig[pairw.res$p.adjusted <= 0.1] <-'.'
+	  sig[pairw.res$p.adjusted <= 0.05] <-'*'
+	  sig[pairw.res$p.adjusted <= 0.01] <-'**'
+	  sig[pairw.res$p.adjusted <= 0.001] <-'***'
+    pairw.res <- data.frame(pairw.res[, 1:7], sig)
+  }
+  class(pairw.res) <- c('pwadonis', 'data.frame')
+  return(pairw.res)
+}
+
+adonis.type <- pairwise.adonis(t(sub_otu_table), sub_design$Type, perm = 1000, p.adjust.m = 'fdr')
+```
+
+### VPA
+
+```{r}
+mod <- varpart(t(sub_otu_table), sub_design$Region, sub_design$Type, transfo = 'hel')
+plot(mod, Xnames = c('Region', 'Type'), bg = c('blue', 'red'))
+```
+
+### CAP
+
+```{r}
+decorana(counts.raw)  # Axis lengths  5.0664
+
+variability_table = function(cap){
+  chi = c(cap$tot.chi, cap$CCA$tot.chi, cap$CA$tot.chi)
+  variability_table = cbind(chi, chi/chi[1])
+  colnames(variability_table) = c("inertia", "proportion")
+  rownames(variability_table) = c("total", "constrained", "unconstrained")
+  return(variability_table)
+}
+
+cap.type <- capscale(t(sub_otu_table) ~ Type, data = sub_design, add = F, sqrt.dist = T, distance = 'bray') 
+perm.type <- anova.cca(cap.type, permutations = 1000, parallel = 4)
+
+var.type <- variability_table(cap.type)
+eig <- cap.type$CCA$eig
+variance <- var.type['constrained', 'proportion']
+p.val <- perm.type[1, 4]
+
+points <- as.data.frame(cap.type$CCA$wa[, 1:2])
+colnames(points) <- c('x', 'y')
+points <- cbind(points, sub_design)
+
+cap.p <- points %>%
+  ggplot(aes(x = x, y = y, color = Type)) + theme_bw() + geom_point(alpha = .7, size = 1.5) + scale_color_brewer(palette = 'Dark2') + labs(x = paste('CPCoA 1 (', format(100 * eig[1] / sum(eig), digits = 4), '%)', sep = ''), y = paste('CPCoA 2 (', format(100 * eig[2] / sum(eig), digits = 4), '%)', sep = '')) + ggtitle(paste(format(100 * variance, digits = 3), ' % of variance; p = ',format(p.val, digits = 2),sep = '')) + stat_ellipse(level = 0.95) + coord_fixed()
+ggsave('cap_type.pdf', cap.p, height = 5, width = 4)
+```
+
+## taxa composition
+
+### pheatmap
+
+```{r}
+top30 <- read.table('top30.txt', header = T, row.names = 1, sep = '\t')
+col.grp <- read.table('top30_grp.txt', header = T, row.names = 1, sep = '\t')
+row.grp <- read.table('top30_taxon.txt', header = T, row.names = 1, sep = '\t')
+
+col <- colorRampPalette(c('lightblue', 'yellow', 'orange', 'red'), bias = 3, alpha = .8)(300)
+ann.colors <- list(Region = c(W1 = '#66A61E', W6 = '#E6AB02'), Type = c(Leaf = '#1B9E77', Root = '#D95F02', Sediment = '#7570B3', Water = '#E7298A'), Phylum = c(Proteobacteria = '#8DA0CB', Bacteroidetes = '#E78AC3', Actinobacteria = '#66C2A5', Cyanobacteria = '#FFD92F', Verrucomicrobia = '#E5C494', Chloroflexi = '#FC8D62', Planctomycetes = '#A6D854', Fusobacteria = '#B3B3B3'))
+
+taxa.p <- top30 %>%
+  pheatmap(cluster_col = F, cluster_row = F, annotation_col = col.grp, annotation_row = row.grp, col = col, annotation_colors = ann.colors, gaps_col = 12, gaps_row = c(15, 23), cellheight = 15, cellwidth = 15, filename = 'pheatmap.pdf')
+```
+
+### barplot with hclust
+
+```{r}
+counts.group <- melt(cbind(t(sub_otu_table), sub_design), id.vars = c('Region', 'Site', 'Group', 'Type')) %>%
+  group_by(Group,variable) %>%
+  mutate(avg = mean(value)*100) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+
+otu.dis <- vegdist(t(counts.group), method = 'bray')
+otu.tree <- hclust(otu.dis, method = 'average')
+plot(otu.tree)
+```
+
+```{r}
+# https://mp.weixin.qq.com/s?__biz=MzIxNzc1Mzk3NQ==&mid=2247484622&idx=1&sn=d9df6f5350f0b8a877e55a9700be76fb&chksm=97f5b4d6a0823dc0e92abba36d81e23c45dc56c1102b085459e0265caf8971112ed7620359dd#rd
+grp <- data.frame(Type = rep(c('Leaf', 'Root', 'Sediment', 'Water'), 2))
+rownames(grp) <- colnames(counts.group)
+group_col <- c('#1B9E77', '#D95F02', '#7570B3', '#E7298A')
+names(group_col) <- c('Leaf', 'Root', 'Sediment', 'Water')
+group_name <- c('Leaf', 'Root', 'Sediment', 'Water')
+
+layout(t(c(1, 2, 2, 2, 3)))
+par(mar = c(5, 2, 5, 0))
+ 
+plot(0, type = 'n', xaxt = 'n', yaxt = 'n', frame.plot = FALSE, xlab = '', ylab = '', xlim = c(-max(otu.tree$height), 0), ylim = c(0, length(otu.tree$order)))
+legend('topleft', legend = group_name, pch = 15, col = group_col, bty = 'n', cex = 1)
+
+treeline <- function(pos1, pos2, height, col1, col2) {
+  meanpos <- (pos1[1] + pos2[1]) / 2
+  segments(y0 = pos1[1] - 0.4, x0 = -pos1[2], y1 = pos1[1] - 0.4, x1 = -height,  col = col1, lwd = 2)
+  segments(y0 = pos1[1] - 0.4, x0 = -height,  y1 = meanpos - 0.4, x1 = -height,  col = col1, lwd = 2)
+  segments(y0 = meanpos - 0.4, x0 = -height,  y1 = pos2[1] - 0.4, x1 = -height,  col = col2, lwd = 2)
+  segments(y0 = pos2[1] - 0.4, x0 = -height,  y1 = pos2[1] - 0.4, x1 = -pos2[2], col = col2, lwd = 2)
+}
+ 
+meanpos <- matrix(rep(0, 2 * length(otu.tree$order)), ncol = 2)
+meancol <- rep(0, length(otu.tree$order))
+for (step in 1:nrow(otu.tree$merge)) {
+  if(otu.tree$merge[step, 1] < 0){
+    pos1 <- c(which(otu.tree$order == -otu.tree$merge[step, 1]), 0)
+    col1 <- group_col[grp[otu.tree$labels[-otu.tree$merge[step, 1]], ]]
+  } else {
+    pos1 <- meanpos[otu.tree$merge[step, 1], ]
+    col1 <- meancol[otu.tree$merge[step, 1]]
+  }
+  if (otu.tree$merge[step, 2] < 0) {
+    pos2 <- c(which(otu.tree$order == -otu.tree$merge[step, 2]), 0)
+    col2 <- group_col[grp[otu.tree$labels[-otu.tree$merge[step, 2]], ]]
+  } else {
+    pos2 <- meanpos[otu.tree$merge[step, 2], ]
+    col2 <- meancol[otu.tree$merge[step, 2]]
+  }
+  height <- otu.tree$height[step]
+  treeline(pos1, pos2, height, col1, col2)
+  meanpos[step, ] <- c((pos1[1] + pos2[1]) / 2, height)
+  if (col1 == col2) meancol[step] <- col1 else meancol[step] <- 'grey'
+}
+
+top.phy <- read.table('top_phy.txt', header = T, row.names = 1, sep = '\t')
+top.phy <- top.phy[, otu.tree$order]
+
+phylum_color <- c('#8DA0CB', '#FFD92F', '#E78AC3', '#FC8D62', '#66C2A5', '#A6D854', '#E5C494', '#B3B3B3', '#BC80BD', '#80B1D3')
+names(phylum_color) <- rownames(top.phy)
+
+par(mar = c(5, 2, 5, 0))
+ 
+phy.bar <- barplot(as.matrix(top.phy), col = phylum_color, space = 0.4, width = 0.7, cex.axis = 1, horiz = TRUE, cex.lab = 1.2, xlab = 'Relative Abundance', yaxt = 'n', las = 1, ylim = c(0, ncol(top.phy)), border = F)
+
+text(x = -0.035, y = phy.bar, labels = colnames(top.phy), col = group_col[grp[otu.tree$order, ]], xpd = TRUE)
+
+par(mar = c(5, 1, 5, 0))
+plot(0, type = 'n', xaxt = 'n', yaxt = 'n', bty = 'n', xlab = '', ylab = '')
+legend('left', pch = 15, col = phylum_color, legend = names(phylum_color), bty = 'n', cex = 1)
+```
+
+## transformation for lefse
+
+```{r}
+# https://github.com/microbiota/amplicon
+taxa <- read.table('taxonomy.txt', header = T, row.names = 1, sep = '\t')
+
+format2lefse(counts.raw, taxa, meta.cca, thre = 0.5, groupID = 'Type', output = 'LEfSe_0.5.txt')
+```
+
+## random forest at genus level
+
+### modeling
+
+```{r}
+l6 <- read.table('sum_taxa/otu_table_tax_filtered_L6.txt', header = T, row.names = 1, sep = '\t')
+
+train.idx <- list()
+set.seed(610)
+for (i in seq(from = 1, to = 120, by = 5)){
+  train.idx <- append(train.idx, sample(seq(from = i, to = i+4, by = 1), 4))
+}
+train.idx <- unlist(train.idx)
+train.l6 <- l6[, train.idx]
+train.design <- meta.cca[colnames(train.l6), ]
+
+set.seed(610)
+l6.rf = randomForest(t(train.l6), train.design$Type, importance = TRUE, proximity = TRUE, ntree = 10000)
+print(l6.rf)
+#         OOB estimate of  error rate: 4.17%
+# Confusion matrix:
+#          Leaf Root Sediment Water class.error
+# Leaf       24    0        0     0   0.0000000
+# Root        4   20        0     0   0.1666667
+# Sediment    0    0       24     0   0.0000000
+# Water       0    0        0    24   0.0000000
+```
+
+### cross validation
+
+```{r}
+set.seed(610)
+l6.cv <- rfcv(t(train.l6), train.design$Type, cv.fold = 5)
+l6.cv$error.cv  # 40
+with(l6.cv, plot(n.var, error.cv, log = 'x', type = 'o', lwd = 2))
+```
+
+```{r}
+imp <- as.data.frame(l6.rf$importance)
+imp <- imp[order(imp[, 5], decreasing = T), ]
+head(imp, n = 10)
+write.table(imp, file = 'importance_genus.txt', quote = F, sep = '\t', row.names = T, col.names = T)
+#varImpPlot(l6.rf, n.var = 40, bg = par('bg'), color = par('fg'), gcolor = par('fg'), lcolor = 'gray')
+```
+
+### extract important features
+
+```{r}
+imp.40 <- head(imp, n = 40)
+imp.40 <- imp.40[order(1:40, decreasing = T), ]
+
+imp.40$temp <- gsub('D_0__Bacteria;D_1__', '', rownames(imp.40), perl = TRUE)
+imp.40$phylum <- gsub(';[\\w\\W]+', '', imp.40$temp, perl = TRUE)
+
+imp.40$genus <- gsub('[\\w-\\W;]+;D_3__', '', imp.40$temp, perl = TRUE)
+imp.40$genus <- gsub('D_4__', '', imp.40$genus, perl = TRUE)
+imp.40$genus <- gsub('D_5__', '', imp.40$genus, perl = TRUE)
+imp.40$genus <- factor(imp.40$genus, levels = imp.40$genus)
+
+imp.p <- imp.40 %>%
+  ggplot(aes(x = genus, y = MeanDecreaseAccuracy, fill = phylum)) + geom_bar(stat = 'identity') + coord_flip() + theme_classic() + scale_fill_manual(values =  c('#66C2A5', '#E78AC3', '#FC8D62', '#FFD92F', '#A6D854', '#8DA0CB', '#E5C494'))
+imp.p
+ggsave(imp.p, filename = 'importance40.pdf', width = 10, height =  6)
+```
+
+### testing
+
+```{r}
+test.idx <- !(rownames(meta.cca) %in% rownames(train.design))
+test.design <- meta.cca[test.idx, ]
+test.l6 <- l6[, rownames(test.design)]
+
+test.l6.t <- test.l6 %>%
+  t(.) %>%
+  as.data.frame(.) %>%
+  mutate(Type = test.design$Type)
+
+set.seed(610)
+l6.pred <- predict(l6.rf, t(test.l6) )  
+l6.pre_tab <- table(observed = test.l6.t[, 'Type'], predicted = l6.pred) 
+l6.pre_tab
+# observed   Leaf Root Sediment Water
+#  Leaf        6    0        0     0
+#  Root        0    6        0     0
+#  Sediment    0    0        6     0
+#  Water       0    0        0     6
+```
+
+```{r}
+l6.imp.40 <- l6[rownames(imp.40), ]
+l6.imp.40.meta <- melt(cbind(t(l6.imp.40), meta), id.var = c('SampleID', 'Region', 'Site', 'Group', 'Type')) %>%
+  group_by(Group, variable) %>%
+  mutate(RA = mean(value) * 100) %>%
+  select(Group, variable, RA) %>%
+  distinct(Group, .keep_all = T) %>%
+  spread(Group, RA)
+
+l6.imp.40.meta$temp <- gsub('D_0__Bacteria;D_1__', '', l6.imp.40.meta$variable, perl = TRUE)
+l6.imp.40.meta$genus <- gsub('[\\w-\\W;]+;D_3__', '', l6.imp.40.meta$temp, perl = TRUE)
+l6.imp.40.meta$genus <- gsub('D_4__', '', l6.imp.40.meta$genus, perl = TRUE)
+l6.imp.40.meta$genus <- gsub('D_5__', '', l6.imp.40.meta$genus, perl = TRUE)
+
+l6.imp.40.meta <- l6.imp.40.meta %>%
+  select(-variable, -temp) %>%
+  column_to_rownames('genus')
+
+col.grp1 <- data.frame(Region = c(rep('W1', 4), rep('W6', 4)), Type = c(rep(c('Leaf', 'Root', 'Sediment', 'Water'), 2)))
+rownames(col.grp1) <- colnames(l6.imp.40.meta)[2:9]
+col1 <- colorRampPalette(c('white', 'lightpink1', 'lightcoral', 'indianred1', 'indianred3'), bias = 3, alpha = .8)(300)
+
+l6.imp.40.p <- l6.imp.40.meta[, 2:9] %>%
+  pheatmap(cluster_col = F, cluster_row = F, annotation_col = col.grp1, annotation_colors = ann.colors, col = col1, cellheight = 10, cellwidth = 10, filename = 'imp40_pheatmap.pdf')
+```
+
+## random forest at family level
+
+```{r}
+l5 <- read.table('sum_taxa/otu_table_tax_filtered_L5.txt', header = T, row.names = 1, sep = '\t')
+
+train.l5 <- l5[, train.idx]
+#train.design <- meta.cca[colnames(train.l5), ]
+
+set.seed(610)
+l5.rf = randomForest(t(train.l5), train.design$Type, importance = TRUE, proximity = TRUE, ntree = 10000)
+print(l5.rf)
+#         OOB estimate of  error rate: 7.29%
+# Confusion matrix:
+#          Leaf Root Sediment Water class.error
+# Leaf       23    1        0     0  0.04166667
+# Root        6   18        0     0  0.25000000
+# Sediment    0    0       24     0  0.00000000
+# Water       0    0        0    24  0.00000000
+```
+
+```{r}
+set.seed(610)
+l5.cv <- rfcv(t(train.l5), train.design$Type, cv.fold = 5)
+l5.cv$error.cv  # 43
+with(l5.cv, plot(n.var, error.cv, log = 'x', type = 'o', lwd = 2))
+```
+
+```{r}
+imp.l5 <- as.data.frame(l5.rf$importance)
+imp.l5 <- imp.l5[order(imp.l5[, 5], decreasing = T), ]
+head(imp.l5, n = 10)
+write.table(imp.l5, file = 'importance_family.txt', quote = F, sep = '\t', row.names = T, col.names = T)
+#varImpPlot(l6.rf, n.var = 40, bg = par('bg'), color = par('fg'), gcolor = par('fg'), lcolor = 'gray')
+```
+
+```{r}
+imp.l5.43 <- head(imp.l5, n = 43)
+imp.l5.43 <- imp.l5.43[order(1:43, decreasing = T), ]
+
+imp.l5.43$temp <- gsub('D_0__Bacteria;D_1__', '', rownames(imp.l5.43), perl = TRUE)
+imp.l5.43$phylum <- gsub(';[\\w\\W]+', '', imp.l5.43$temp, perl = TRUE)
+
+imp.l5.43$family <- gsub('[\\w-\\W;]+;D_2__', '', imp.l5.43$temp, perl = TRUE)
+imp.l5.43$family <- gsub('D_3__', '', imp.l5.43$family, perl = TRUE)
+imp.l5.43$family <- gsub('D_4__', '', imp.l5.43$family, perl = TRUE)
+imp.l5.43$family <- factor(imp.l5.43$family, levels = imp.l5.43$family)
+
+imp.l5.p <- imp.l5.43 %>%
+  ggplot(aes(x = family, y = MeanDecreaseAccuracy, fill = phylum)) + geom_bar(stat = 'identity') + coord_flip() + theme_classic() + scale_fill_manual(values =  c('#66C2A5', '#E78AC3', '#FC8D62', '#FFD92F', '#A6D854', '#8DA0CB', '#E5C494'))
+imp.l5.p
+ggsave(imp.l5.p, filename = 'importance43family.pdf', width = 10, height =  6)
+```
+
+```{r}
+test.l5 <- l5[, rownames(test.design)]
+
+test.l5.t <- test.l5 %>%
+  t(.) %>%
+  as.data.frame(.) %>%
+  mutate(Type = test.design$Type)
+
+set.seed(610)
+l5.pred <- predict(l5.rf, t(test.l5) )  
+l5.pre_tab <- table(observed = test.l5.t[, 'Type'], predicted = l5.pred) 
+l5.pre_tab
+# observed   Leaf Root Sediment Water
+#  Leaf        6    0        0     0
+#  Root        0    6        0     0
+#  Sediment    0    0        6     0
+#  Water       0    0        0     6
+```
+
+```{r}
+l5.imp.43 <- l5[rownames(imp.l5.43), ]
+l5.imp.43.meta <- melt(cbind(t(l5.imp.43), meta), id.var = c('SampleID', 'Region', 'Site', 'Group', 'Type')) %>%
+  group_by(Group, variable) %>%
+  mutate(RA = mean(value) * 100) %>%
+  select(Group, variable, RA) %>%
+  distinct(Group, .keep_all = T) %>%
+  spread(Group, RA)
+
+l5.imp.43.meta$temp <- gsub('D_0__Bacteria;D_1__', '', l5.imp.43.meta$variable, perl = TRUE)
+l5.imp.43.meta$family <- gsub('[\\w-\\W;]+;D_2__', '', l5.imp.43.meta$temp, perl = TRUE)
+l5.imp.43.meta$family <- gsub('D_3__', '', l5.imp.43.meta$family, perl = TRUE)
+l5.imp.43.meta$family <- gsub('D_4__', '', l5.imp.43.meta$family, perl = TRUE)
+
+l5.imp.43.meta <- l5.imp.43.meta %>%
+  select(-variable, -temp) %>%
+  column_to_rownames('family')
+
+l5.imp.43.p <- l5.imp.43.meta[, 2:9] %>%
+  pheatmap(cluster_col = F, cluster_row = F, annotation_col = col.grp1, annotation_colors = ann.colors, col = col1, cellheight = 10, cellwidth = 10, filename = 'imp43_family_pheatmap.pdf')
+```
