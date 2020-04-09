@@ -1,0 +1,496 @@
+---
+title: '20200408'
+author: "ZHZ"
+date: "2020/4/8"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## import libraries
+
+```{r}
+library(tidyverse)
+library(reshape2)
+library(vegan)
+library(pheatmap)
+library(vcd)
+library(randomForest)
+```
+
+## read in tables
+
+```{r}
+meta <- read.table('meta.txt', header = T, row.names = 1, sep = '\t')
+ko.raw <- read.table('../3.5.6-taxa-func-stat/KEGG/kegg_ko_abundance.txt', header = T, row.names = 1, sep = '\t')
+
+ko.tpm <- ko.raw * 1e6
+ko.tpm <- ko.tpm[rowMeans(ko.tpm) > 0.5, ]
+ko.tpm <- ko.tpm[, rownames(meta)]
+
+write.table(ko.tpm, 'ko_tpm.txt', sep = '\t')
+```
+
+## CPCoA
+
+```{r}
+anosim.type <- anosim(t(ko.tpm), meta$Type, permutations = 1000, distance = 'bray', parallel = 4)
+# ANOSIM statistic R: 0.5566, Significance: 0.000999
+pdf('anosim_type.pdf', width = 5, height = 4)
+plot(anosim.type, col = c('grey', '#1B9E77', '#D95F02', '#7570B3', '#E7298A'))
+dev.off()
+anosim.region <- anosim(t(ko.tpm), meta$Region, permutations = 1000, distance = 'bray', parallel = 4)
+# ANOSIM statistic R: 0.228, Significance: 0.006993
+
+adonis(t(ko.tpm) ~ meta$Type, permutations = 1000, distance = 'bray', parallel = 4)
+#           Df SumsOfSqs MeanSqs F.Model      R2   Pr(>F)    
+# meta$Type  3   0.31596 0.10532  12.907 0.65941 0.000999 ***
+# Residuals 20   0.16320 0.00816         0.34059             
+# Total     23   0.47915                 1.00000             
+adonis(t(ko.tpm) ~ meta$Region, permutations = 1000, distance = 'bray', parallel = 4)
+#             Df SumsOfSqs  MeanSqs F.Model      R2  Pr(>F)  
+# meta$Region  1   0.05575 0.055755   2.897 0.11636 0.04695 *
+# Residuals   22   0.42340 0.019245         0.88364          
+# Total       23   0.47915                  1.00000          
+
+pairwise.adonis <- function(x,factors, sim.function = 'vegdist', sim.method = 'bray', p.adjust.m ='bonferroni',reduce = NULL,perm = 999){
+  co <- combn(unique(as.character(factors)), 2)
+  pairs <- c()
+  Df <- c()
+  SumsOfSqs <- c()
+  F.Model <- c()
+  R2 <- c()
+  p.value <- c()
+  
+  for(elem in 1:ncol(co)){
+    if(inherits(x, 'dist')){
+      x1=as.matrix(x)[factors %in% c(as.character(co[1,elem]), as.character(co[2,elem])),
+                      factors %in% c(as.character(co[1,elem]), as.character(co[2,elem]))]
+      }
+    else  (
+      if (sim.function == 'daisy'){x1 = daisy(x[factors %in% c(co[1,elem], co[2, elem]),], metric = sim.method)} 
+      else{x1 = vegdist(x[factors %in% c(co[1,elem], co[2, elem]), ], method = sim.method)}
+    )
+    
+    ad <- adonis(x1 ~ factors[factors %in% c(co[1, elem], co[2, elem])], permutations = perm)
+    pairs <- c(pairs, paste(co[1,elem], 'vs', co[2,elem]))
+    Df <- c(Df, ad$aov.tab[1, 1])
+	  SumsOfSqs <- c(SumsOfSqs, ad$aov.tab[1, 2])
+	  F.Model <- c(F.Model, ad$aov.tab[1, 4])
+    R2 <- c(R2, ad$aov.tab[1, 5])
+    p.value <- c(p.value, ad$aov.tab[1, 6])
+  }
+  p.adjusted <- p.adjust(p.value, method = p.adjust.m)
+  
+  sig = c(rep('', length(p.adjusted)))
+  sig[p.adjusted <= 0.05] <-'.'
+  sig[p.adjusted <= 0.01] <-'*'
+  sig[p.adjusted <= 0.001] <-'**'
+  sig[p.adjusted <= 0.0001] <-'***'
+  pairw.res <- data.frame(pairs, Df, SumsOfSqs, F.Model, R2, p.value, p.adjusted, sig)
+  
+  if(!is.null(reduce)){
+    pairw.res <- subset (pairw.res, grepl(reduce, pairs))
+    pairw.res$p.adjusted <- p.adjust(pairw.res$p.value, method = p.adjust.m)
+    
+    sig = c(rep('',length(pairw.res$p.adjusted)))
+ 	  sig[pairw.res$p.adjusted <= 0.1] <-'.'
+	  sig[pairw.res$p.adjusted <= 0.05] <-'*'
+	  sig[pairw.res$p.adjusted <= 0.01] <-'**'
+	  sig[pairw.res$p.adjusted <= 0.001] <-'***'
+    pairw.res <- data.frame(pairw.res[, 1:7], sig)
+  }
+  class(pairw.res) <- c('pwadonis', 'data.frame')
+  return(pairw.res)
+}
+
+adonis.type <- pairwise.adonis(t(ko.tpm), meta$Type, perm = 1000, p.adjust.m = 'fdr')
+
+mod <- varpart(t(ko.tpm), meta$Region, meta$Type, transfo = 'hel')
+pdf('varpart.pdf', height = 4, width = 5)
+plot(mod, Xnames = c('Region', 'Type'), bg = c('blue', 'red'))
+dev.off()
+```
+
+## mantel test
+
+```{r}
+counts.group <- read.table('../../20200323/counts_group.txt', header = T, row.names = 1, sep = '\t')
+counts.dist <- vegdist(t(counts.group), method = 'bray')
+
+ko.group <- melt(cbind(t(ko.tpm), meta), id.vars = c('Region', 'Group', 'Type')) %>%
+  group_by(Group,variable) %>%
+  mutate(avg = mean(value)) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+
+ko.dist <- vegdist(t(ko.group), method = 'bray')
+ko.tree <- hclust(ko.dist, method = 'average')
+plot(ko.tree)
+
+mantel(counts.dist, ko.dist, method = 'spearman', permutations = 10000, parallel = 4)
+# Mantel statistic r: 0.8818, Significance: 9.999e-05
+
+dist <- data.frame(counts = as.vector(counts.dist), ko = as.vector(ko.dist))
+dist.p <- dist %>%
+  ggplot(aes(counts, ko)) + theme_bw() + geom_point(size = 4, alpha = 0.75, colour = 'black',shape = 21, fill = 'skyblue') + geom_smooth(method = 'lm', colour = 'navy', alpha = 0.2) + labs(x = 'Taxa based Bray-Curtis dissimilarity', y = 'KO based Bray-Curtis dissimilarity')
+
+ggsave(dist.p, filename = 'mantel.pdf', height = 4, width = 4)
+```
+
+```{r}
+decorana(ko.tpm)  # Axis lengths  2.64157
+
+variability_table = function(cap){
+  chi = c(cap$tot.chi, cap$CCA$tot.chi, cap$CA$tot.chi)
+  variability_table = cbind(chi, chi/chi[1])
+  colnames(variability_table) = c("inertia", "proportion")
+  rownames(variability_table) = c("total", "constrained", "unconstrained")
+  return(variability_table)
+}
+
+cap.type <- capscale(t(ko.tpm) ~ Type, data = meta, add = F, sqrt.dist = T, distance = 'bray') 
+perm.type <- anova.cca(cap.type, permutations = 1000, parallel = 4)
+
+var.type <- variability_table(cap.type)
+eig <- cap.type$CCA$eig
+variance <- var.type['constrained', 'proportion']
+p.val <- perm.type[1, 4]
+
+points <- as.data.frame(cap.type$CCA$wa[, 1:2])
+colnames(points) <- c('x', 'y')
+points <- cbind(points, meta)
+
+cap.p <- points %>%
+  ggplot(aes(x = x, y = y, color = Type)) + theme_bw() + geom_point(alpha = .7, size = 1.5) + scale_color_brewer(palette = 'Dark2') + labs(x = paste('CPCoA 1 (', format(100 * eig[1] / sum(eig), digits = 4), '%)', sep = ''), y = paste('CPCoA 2 (', format(100 * eig[2] / sum(eig), digits = 4), '%)', sep = '')) + ggtitle(paste(format(100 * variance, digits = 3), ' % of variance; p = ',format(p.val, digits = 2),sep = '')) + stat_ellipse(level = 0.95) + coord_fixed()
+ggsave('ko_cap_type.pdf', cap.p, height = 4, width = 5)
+```
+
+## ko50
+
+```{r}
+ko50 <- read.table('KO50.txt', header = T, sep = '\t')
+idx.50 <- rownames(ko.tpm) %in% ko50$ko
+
+ko.50 <- ko.tpm[idx.50, ]
+write.table(ko.50, 'ko_50.txt', sep = '\t')
+
+anosim.type.50 <- anosim(t(ko.50), meta$Type, permutations = 1000, distance = 'bray', parallel = 4)
+# ANOSIM statistic R: 0.7193, Significance: 0.000999
+pdf('anosim_type_50.pdf', width = 5, height = 4)
+plot(anosim.type.50, col = c('grey', '#1B9E77', '#D95F02', '#7570B3', '#E7298A'))
+dev.off()
+
+adonis(t(ko.50) ~ meta$Type, permutations = 1000, distance = 'bray', parallel = 4)
+#           Df SumsOfSqs  MeanSqs F.Model      R2   Pr(>F)    
+# meta$Type  3   0.50891 0.169636  25.299 0.79144 0.000999 ***
+# Residuals 20   0.13411 0.006705         0.20856             
+# Total     23   0.64301                  1.00000             
+
+pdf('varpart_50.pdf', width = 5, height = 4)
+plot(varpart(t(ko.50), meta$Region, meta$Type, transfo = 'hel'), Xnames = c('Region', 'Type'), bg = c('blue', 'red'))  # Region:0.03, Type:0.90
+dev.off()
+```
+
+### CPCoA
+
+```{r}
+cap.type.50 <- capscale(t(ko.50) ~ Type, data = meta, add = F, sqrt.dist = T, distance = 'bray') 
+perm.type.50 <- anova.cca(cap.type.50, permutations = 1000, parallel = 4)
+
+var.type.50 <- variability_table(cap.type.50)
+eig.50 <- cap.type.50$CCA$eig
+variance.50 <- var.type.50['constrained', 'proportion']
+p.val.50 <- perm.type.50[1, 4]
+
+points.50 <- as.data.frame(cap.type.50$CCA$wa[, 1:2])
+colnames(points.50) <- c('x', 'y')
+points.50 <- cbind(points.50, meta)
+
+cap.p.50 <- points.50 %>%
+  ggplot(aes(x = x, y = y, color = Type)) + theme_bw() + geom_point(alpha = .7, size = 1.5) + scale_color_brewer(palette = 'Dark2') + labs(x = paste('CPCoA 1 (', format(100 * eig.50[1] / sum(eig.50), digits = 4), '%)', sep = ''), y = paste('CPCoA 2 (', format(100 * eig.50[2] / sum(eig.50), digits = 4), '%)', sep = '')) + ggtitle(paste(format(100 * variance.50, digits = 3), ' % of variance; p = ',format(p.val.50, digits = 2),sep = '')) + stat_ellipse(level = 0.95) + coord_fixed()
+
+ggsave('ko50_cap_type.pdf', cap.p.50, height = 5, width = 5)
+```
+
+### mantel test
+
+```{r}
+ko.50 <- ko.50[, rownames(meta)]
+ko50.group <- melt(cbind(t(ko.50), meta), id.vars = c('Region', 'Group', 'Type')) %>%
+  group_by(Group,variable) %>%
+  mutate(avg = mean(value)) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+
+ko50.dist <- vegdist(t(ko50.group), method = 'bray')
+ko50.tree <- hclust(ko50.dist, method = 'average')
+plot(ko50.tree)
+
+mantel(counts.dist, ko50.dist, method = 'spearman', permutations = 10000, parallel = 4)
+# Mantel statistic r: 0.8714, Significance: 9.999e-05
+
+dist.50 <- data.frame(counts = as.vector(counts.dist), ko50 = as.vector(ko50.dist))
+dis.50.p <- dist.50 %>%
+  ggplot(aes(counts, ko50)) + theme_bw() + geom_point(size = 4, alpha = 0.75, colour = 'black',shape = 21, fill = 'skyblue') + geom_smooth(method = 'lm', colour = 'navy', alpha = 0.2) + labs(x = 'Taxa based Bray-Curtis dissimilarity', y = 'KO based Bray-Curtis dissimilarity')
+
+ggsave(dis.50.p, filename = 'ko50_mantel.pdf', height = 4, width = 4)
+
+dist.name <- c('W1L-W1R', 'W1L-W1S', 'W1L-W1W', 'W1L-W6L', 'W1L-W6R', 'W1L-W6S', 'W1L-W6W', 'W1R-W1S', 'W1R-W1W', 'W1R-W6L', 'W1R-W6R', 'W1R-W6S', 'W1R-W6W', 'W1S-W1W', 'W1S-W6L', 'W1S-W6R', 'W1S-W6S', 'W1S-W6W', 'W1W-W6L', 'W1W-W6R', 'W1W-W6S', 'W1W-W6W', 'W6L-W6R', 'W6L-W6S', 'W6L-W6W', 'W6R-W6S', 'W6R-W6W', 'W6S-W6W')
+row.names(dist.50) <- dist.name
+dist.50$group <- c('LR', 'LS', 'LW', 'LL', 'LR', 'LS', 'LW', 'RS', 'RW', 'RL', 'RR', 'RS', 'RW', 'SW', 'LS', 'RS', 'SS', 'SW', 'LW', 'RW', 'SW', 'WW', 'LR', 'LS', 'LW', 'RS', 'RW', 'SW')
+boxplot(ko50 ~ group, dist.50)
+```
+
+### pheatmap
+
+```{r}
+ko.C.idx <- read.table('ko_C.txt', header = T, sep = '\t')
+ko.N.idx <- read.table('ko_N.txt', header = T, sep = '\t')
+ko.S.idx <- read.table('ko_S.txt', header = T, sep = '\t')
+
+ko.C <- melt(cbind(t(ko.50[rownames(ko.50) %in% ko.C.idx$ko, ]), meta), id.vars = c('Region', 'Group', 'Type')) %>%
+  group_by(Group,variable) %>%
+  mutate(avg = mean(value)) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+ko.C <- ko.C [ko.C.idx$ko, ]
+
+ko.N <- melt(cbind(t(ko.50[rownames(ko.50) %in% ko.N.idx$ko, ]), meta), id.vars = c('Region', 'Group', 'Type')) %>%
+  group_by(Group,variable) %>%
+  mutate(avg = mean(value)) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+ko.N <- ko.N[ko.N.idx$ko, ]
+
+ko.S <- melt(cbind(t(ko.50[rownames(ko.50) %in% ko.S.idx$ko, ]), meta), id.vars = c('Region', 'Group', 'Type')) %>%
+  group_by(Group,variable) %>%
+  mutate(avg = mean(value)) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+ko.S <- ko.S[ko.S.idx$ko, ]
+
+col.grp <- read.table('col_grp.txt', header = T, row.names = 1, sep = '\t')
+ann.colors <- list(Region = c(W1 = '#66A61E', W6 = '#E6AB02'), Type = c(Leaf = '#1B9E77', Root = '#D95F02', Sediment = '#7570B3', Water = '#E7298A'))
+col <- colorRampPalette(c('lightblue', 'yellow', 'orange', 'red'), bias = 2, alpha = .8)(100)
+
+C.p <- ko.C %>%
+  pheatmap(cluster_rows = F, cluster_cols = F, color = col, annotation_col = col.grp, annotation_colors = ann.colors, cellwidth = 15, cellheight = 15, filename = 'C_ko_heatmap.pdf')
+
+N.p <- ko.N %>%
+  pheatmap(cluster_rows = F, cluster_cols = F, color = col, annotation_col = col.grp, annotation_colors = ann.colors, cellwidth = 15, cellheight = 15, filename = 'N_ko_heatmap.pdf')
+
+S.p <- ko.S %>%
+  pheatmap(cluster_rows = F, cluster_cols = F, color = col, annotation_col = col.grp, annotation_colors = ann.colors, cellwidth = 15, cellheight = 15, filename = 'S_ko_heatmap.pdf')
+```
+
+## Other important KOs
+
+### ternary plot
+
+```{r}
+ko.top <- ko.tpm[rowMeans(ko.tpm) > 500, ]
+write.table(ko.top, 'ko_top.txt', sep = '\t', quote = F)
+
+# STAMP two group comparison: White's non-parametric t-test; multiple test correction: Bonferroni
+ko.tern <- read.table('ko_tern.txt', header = T, row.names = 1, sep = '\t')
+ko.tern$Size <- (apply(ko.tern[1:3], 1, mean))^0.5/30
+
+alpha = .5
+c_green = rgb( 50 / 255, 200 / 255, 100 / 255, alpha)
+c_brown = rgb(101 / 255,  67 / 255,  33 / 255, alpha)
+c_blue = rgb(  0 / 255, 000 / 255, 255 / 255, alpha)
+c_grey = rgb(180 / 255, 180 / 255,  180 / 255, alpha)
+
+ko.tern[which(ko.tern$Enrich == 'Plant'), 'Color'] <- c_green
+ko.tern[which(ko.tern$Enrich == 'Sediment'), 'Color'] <- c_brown
+ko.tern[which(ko.tern$Enrich == 'Water'), 'Color'] <- c_blue
+ko.tern[which(ko.tern$Enrich == 'nosig'), 'Color'] <- c_grey
+
+pdf('ternary.pdf')
+ternaryplot(ko.tern[1:3], scale = NULL, col = ko.tern$Color, prop_size = FALSE, cex = ko.tern$Size)
+grid_legend(x = 0.8, y = 0.7, pch = c(19, 19, 19), col = c(c_green, c_brown, c_blue), label = c('Plant', 'Sediment', 'Water'), title = FALSE, frame = FALSE)
+dev.off()
+```
+
+```{r}
+ko.top <- ko.tpm[rowMeans(ko.tpm) > 100, ]
+write.table(ko.top, 'STAMP/ko_top.txt', sep = '\t', quote = F)
+
+ko.tern <- read.table('STAMP/ko_tern.txt', header = T, row.names = 1, sep = '\t')
+ko.tern$Size <- (apply(ko.tern[1:3], 1, mean)) * 10
+
+alpha = .5
+c_green = rgb( 50 / 255, 200 / 255, 100 / 255, alpha)
+c_brown = rgb(101 / 255,  67 / 255,  33 / 255, alpha)
+c_blue = rgb(  0 / 255, 000 / 255, 255 / 255, alpha)
+
+ko.tern[which(ko.tern$Enrich == 'Plant'), 'Color'] <- c_green
+ko.tern[which(ko.tern$Enrich == 'Sediment'), 'Color'] <- c_brown
+ko.tern[which(ko.tern$Enrich == 'Water'), 'Color'] <- c_blue
+
+pdf('STAMP/ternary.pdf')
+ternaryplot(ko.tern[1:3], scale = NULL, col = ko.tern$Color, prop_size = FALSE, cex = ko.tern$Size)
+grid_legend(x = 0.8, y = 0.7, pch = c(19, 19, 19), col = c(c_green, c_brown, c_blue), label = c('Plant', 'Sediment', 'Water'), title = FALSE, frame = FALSE)
+dev.off()
+```
+
+### random forest
+
+```{r}
+l3.raw <- read.table('3.5.6-taxa-func-stat/KEGG/kegg_L3_abundance.txt', header = T, row.names = 1, sep = '\t')
+
+l3.tpm <- l3.raw * 1e6
+l3.tpm <- l3.tpm[rowMeans(l3.tpm) > 20, ]
+l3.tpm <- l3.tpm[, rownames(meta)]
+
+l3.group <- melt(cbind(t(l3.tpm), meta), id.vars = c('Region', 'Type', 'Group')) %>%
+  group_by(Group, variable) %>%
+  mutate(avg = mean(value)) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+
+write.table(l3.group, 'l3_group.txt', sep = '\t')
+```
+
+```{r}
+set.seed(610)
+l3.rf = randomForest(t(l3.tpm), as.factor(rep(c('Plant', 'Plant', 'Sediment', 'Water'), 6)), importance = TRUE, proximity = TRUE, ntree = 10000)
+print(l3.rf)
+
+set.seed(610)
+l3.cv <- rfcv(t(l3.tpm), as.factor(rep(c('Plant', 'Plant', 'Sediment', 'Water'), 6)), cv.fold = 5)
+l3.cv$error.cv  # 7,13,26
+with(l3.cv, plot(n.var, error.cv, log = 'x', type = 'o', lwd = 2))
+
+imp <- as.data.frame(l3.rf$importance)
+imp <- imp[order(imp[, 5], decreasing = T), ]
+head(imp, n = 10)
+write.table(imp, file = 'importance_l3_1.txt', quote = F, sep = '\t', row.names = T, col.names = T)
+varImpPlot(l3.rf, n.var = 26, bg = par('bg'), color = par('fg'), gcolor = par('fg'), lcolor = 'gray')
+```
+
+```{r}
+# KOs in RF selected pathways
+sel.ko <- read.table('selectedKO.txt', header = T, sep = '\t')
+idx <- rownames(ko.tpm) %in% sel.ko$ko
+
+ko.sel <- ko.tpm[idx, ]
+write.table(ko.sel, 'ko_sel.txt', sep = '\t')
+```
+
+### bar plot with hclust
+
+```{r}
+sel.group <- melt(cbind(t(ko.sel), meta), id.vars = c('Region', 'Group', 'Type')) %>%
+  group_by(Group,variable) %>%
+  mutate(avg = mean(value)) %>%
+  distinct(Group, .keep_all = T) %>%
+  ungroup() %>%
+  select(Group, variable, avg) %>%
+  spread(Group, avg) %>%
+  column_to_rownames('variable')
+
+write.table(t(sel.group), 'sel_group.txt', sep = '\t')
+
+sel.dis <- vegdist(t(sel.group), method = 'bray')
+sel.tree <- hclust(sel.dis, method = 'average')
+plot(sel.tree)
+```
+
+```{r}
+pdf('sel_l3_bar.pdf', width = 12, height = 6)
+grp <- data.frame(Type = rep(c('Leaf', 'Root', 'Sediment', 'Water'), 2))
+rownames(grp) <- colnames(sel.group)
+group_col <- c('#1B9E77', '#D95F02', '#7570B3', '#E7298A')
+names(group_col) <- c('Leaf', 'Root', 'Sediment', 'Water')
+group_name <- c('Leaf', 'Root', 'Sediment', 'Water')
+
+layout(t(c(1, 2, 2, 2, 3)))
+par(mar = c(5, 2, 5, 0))
+ 
+plot(0, type = 'n', xaxt = 'n', yaxt = 'n', frame.plot = FALSE, xlab = '', ylab = '', xlim = c(-max(sel.tree$height), 0), ylim = c(0, length(sel.tree$order)))
+legend('topleft', legend = group_name, pch = 15, col = group_col, bty = 'n', cex = 1)
+
+treeline <- function(pos1, pos2, height, col1, col2) {
+  meanpos <- (pos1[1] + pos2[1]) / 2
+  segments(y0 = pos1[1] - 0.4, x0 = -pos1[2], y1 = pos1[1] - 0.4, x1 = -height,  col = col1, lwd = 2)
+  segments(y0 = pos1[1] - 0.4, x0 = -height,  y1 = meanpos - 0.4, x1 = -height,  col = col1, lwd = 2)
+  segments(y0 = meanpos - 0.4, x0 = -height,  y1 = pos2[1] - 0.4, x1 = -height,  col = col2, lwd = 2)
+  segments(y0 = pos2[1] - 0.4, x0 = -height,  y1 = pos2[1] - 0.4, x1 = -pos2[2], col = col2, lwd = 2)
+}
+ 
+meanpos <- matrix(rep(0, 2 * length(sel.tree$order)), ncol = 2)
+meancol <- rep(0, length(sel.tree$order))
+for (step in 1:nrow(sel.tree$merge)) {
+  if(sel.tree$merge[step, 1] < 0){
+    pos1 <- c(which(sel.tree$order == -sel.tree$merge[step, 1]), 0)
+    col1 <- group_col[grp[sel.tree$labels[-sel.tree$merge[step, 1]], ]]
+  } else {
+    pos1 <- meanpos[sel.tree$merge[step, 1], ]
+    col1 <- meancol[sel.tree$merge[step, 1]]
+  }
+  if (sel.tree$merge[step, 2] < 0) {
+    pos2 <- c(which(sel.tree$order == -sel.tree$merge[step, 2]), 0)
+    col2 <- group_col[grp[sel.tree$labels[-sel.tree$merge[step, 2]], ]]
+  } else {
+    pos2 <- meanpos[sel.tree$merge[step, 2], ]
+    col2 <- meancol[sel.tree$merge[step, 2]]
+  }
+  height <- sel.tree$height[step]
+  treeline(pos1, pos2, height, col1, col2)
+  meanpos[step, ] <- c((pos1[1] + pos2[1]) / 2, height)
+  if (col1 == col2) meancol[step] <- col1 else meancol[step] <- 'grey'
+}
+
+sel.l3 <- read.table('sel_group_r.txt', header = T, row.names = 1, sep = '\t', check.names = F)
+sel.l3 <- sel.l3[, sel.tree$order]
+
+l3_color <- c('#B2182B', '#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#CC6666', '#9999CC')
+names(l3_color) <- rownames(sel.l3)
+
+par(mar = c(5, 2, 5, 0))
+ 
+l3.bar <- barplot(as.matrix(sel.l3), col = l3_color, space = 0.4, width = 0.7, cex.axis = 1, horiz = TRUE, cex.lab = 1.2, xlab = 'TPM', yaxt = 'n', las = 1, ylim = c(0, ncol(sel.l3)), border = F)
+
+text(x = -300, y = l3.bar, labels = colnames(sel.l3), col = group_col[grp[sel.tree$order, ]], xpd = TRUE)
+
+par(mar = c(5, 1, 5, 0))
+plot(0, type = 'n', xaxt = 'n', yaxt = 'n', bty = 'n', xlab = '', ylab = '')
+legend('left', pch = 15, col = l3_color, legend = names(l3_color), bty = 'n', cex = 1)
+dev.off()
+```
+
+### pheatmap
+
+```{r}
+sel.group.sel <- sel.group[rowMeans(sel.group) > 100, ]
+write.table(sel.group.sel, 'sel_group_sel.txt', sep = '\t')
+
+row.grp <- read.table('row_grp.txt', header = T, row.names = 1, sep = '\t')
+sel.group.sel <- sel.group.sel[rownames(row.grp), ]
+col <- colorRampPalette(c('#276419', '#4D9221', '#FDE0EF', '#DE77AE', '#C51B7D', '#8E0152'), bias = 3, alpha = .8)(100)
+anno.col <- list(Map = c(`Bacterial chemotaxis` = '#B2182B', `Flagellar assembly` = '#009E73', `Lipopolysaccharide biosynthesis` = '#F0E442', `Secondary bile acid biosynthesis` = '#CC6666', `Penicillin and cephalosporin biosynthesis` = '#0072B2', `Ethylbenzene degradation` = '#56B4E9'))
+ko.p <- sel.group.sel %>%
+  pheatmap(cluster_rows = F, cluster_cols = F, color = col, annotation_row = row.grp, annotation_colors = anno.col, cellwidth = 15, cellheight = 15, filename = 'ko_heatmap.pdf')
+```
